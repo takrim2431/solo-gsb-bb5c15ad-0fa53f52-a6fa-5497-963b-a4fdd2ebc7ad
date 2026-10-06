@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # 端到端调用示例：覆盖证书登记、幂等、区间冲突、测量校验、撤销与实时有效性，
-# 以及测量更正（版本冲突、并发唯一成功、完整历史查询）。
+# 测量更正（版本冲突、并发唯一成功、完整历史查询），以及测量批次写入
+# （整批校验、批次键幂等、撤销后重放、整批原子性）。
 # 用法: BASE=http://localhost:8000 ./examples/demo.sh
 set -euo pipefail
 
@@ -114,3 +115,79 @@ post /measurements/1/corrections \
 
 echo "### 19. 查询完整历史：原始版本 + 按序更正链 + 当前版本（各版本有效性按证书撤销状态实时重算，旧版历史保留可查）"
 get /measurements/1/history
+
+echo "### 20. 批次写入：为批次演示登记两份不重叠的新证书（EQ-100）→ 201"
+post /certificates \
+  '{"device_id":"EQ-100","certificate_no":"CERT-2026-1001","valid_from":"2026-01-01T00:00:00+08:00","valid_to":"2027-01-01T00:00:00+08:00"}' \
+  -H 'Idempotency-Key: reg-eq100-2026'
+post /certificates \
+  '{"device_id":"EQ-100","certificate_no":"CERT-2027-1001","valid_from":"2027-01-01T00:00:00+08:00","valid_to":"2028-01-01T00:00:00+08:00"}' \
+  -H 'Idempotency-Key: reg-eq100-2027'
+
+echo "### 21. 整批提交 3 条有序记录 → 201，record_ids 与输入顺序一一对应"
+post /measurement-batches \
+  '{"batch_key":"lab-upload-2026-10-06-01","records":[
+    {"device_id":"EQ-100","measured_at":"2026-06-15T10:30:00+08:00","certificate_no":"CERT-2026-1001"},
+    {"device_id":"EQ-100","measured_at":"2026-06-16T10:30:00+08:00","certificate_no":"CERT-2026-1001"},
+    {"device_id":"EQ-100","measured_at":"2027-02-01T09:00:00+08:00","certificate_no":"CERT-2027-1001"}
+  ]}'
+
+echo "### 22. 相同批次键 + 相同有序内容重试 → 200 返回首次结果（响应头 Idempotency-Replayed: true）"
+curl -sS -i -X POST "$API/measurement-batches" -H 'Content-Type: application/json' \
+  -d '{"batch_key":"lab-upload-2026-10-06-01","records":[
+    {"device_id":"EQ-100","measured_at":"2026-06-15T10:30:00+08:00","certificate_no":"CERT-2026-1001"},
+    {"device_id":"EQ-100","measured_at":"2026-06-16T10:30:00+08:00","certificate_no":"CERT-2026-1001"},
+    {"device_id":"EQ-100","measured_at":"2027-02-01T09:00:00+08:00","certificate_no":"CERT-2027-1001"}
+  ]}' | head -12
+echo
+
+echo "### 22b. 时刻换时区写法（同一 UTC 时刻）仍视为相同内容 → 200 重放"
+post /measurement-batches \
+  '{"batch_key":"lab-upload-2026-10-06-01","records":[
+    {"device_id":"EQ-100","measured_at":"2026-06-15T11:30:00+09:00","certificate_no":"CERT-2026-1001"},
+    {"device_id":"EQ-100","measured_at":"2026-06-16T03:30:00+01:00","certificate_no":"CERT-2026-1001"},
+    {"device_id":"EQ-100","measured_at":"2027-02-01T01:00:00+00:00","certificate_no":"CERT-2027-1001"}
+  ]}'
+
+echo "### 23. 相同批次键 + 不同内容（含顺序调换）→ 409 IDEMPOTENCY_KEY_CONFLICT"
+post /measurement-batches \
+  '{"batch_key":"lab-upload-2026-10-06-01","records":[
+    {"device_id":"EQ-100","measured_at":"2026-06-16T10:30:00+08:00","certificate_no":"CERT-2026-1001"},
+    {"device_id":"EQ-100","measured_at":"2026-06-15T10:30:00+08:00","certificate_no":"CERT-2026-1001"},
+    {"device_id":"EQ-100","measured_at":"2027-02-01T09:00:00+08:00","certificate_no":"CERT-2027-1001"}
+  ]}'
+
+echo "### 24. 第 2 条落在证书有效期外 → 422，details.index=2，且整批不落库"
+post /measurement-batches \
+  '{"batch_key":"lab-upload-2026-10-06-bad","records":[
+    {"device_id":"EQ-100","measured_at":"2026-06-15T10:30:00+08:00","certificate_no":"CERT-2026-1001"},
+    {"device_id":"EQ-100","measured_at":"2028-06-15T10:30:00+08:00","certificate_no":"CERT-2027-1001"}
+  ]}'
+
+echo "### 25. 失败批次不占用批次键：内容修正后用同键重试 → 201"
+post /measurement-batches \
+  '{"batch_key":"lab-upload-2026-10-06-bad","records":[
+    {"device_id":"EQ-100","measured_at":"2026-06-15T10:30:00+08:00","certificate_no":"CERT-2026-1001"}
+  ]}'
+
+echo "### 26. 撤销 CERT-2026-1001，然后重放批次 21 → 200 且快照仍 is_valid=true（首次结果不因撤销改变）"
+CERT_ID=$(curl -sS "$API/certificates?device_id=EQ-100" | python3 -c '
+import json,sys
+for c in json.load(sys.stdin):
+    if c["certificate_no"] == "CERT-2026-1001": print(c["id"])')
+post "/certificates/$CERT_ID/revoke" '{"reason":"drift found in October audit"}'
+post /measurement-batches \
+  '{"batch_key":"lab-upload-2026-10-06-01","records":[
+    {"device_id":"EQ-100","measured_at":"2026-06-15T10:30:00+08:00","certificate_no":"CERT-2026-1001"},
+    {"device_id":"EQ-100","measured_at":"2026-06-16T10:30:00+08:00","certificate_no":"CERT-2026-1001"},
+    {"device_id":"EQ-100","measured_at":"2027-02-01T09:00:00+08:00","certificate_no":"CERT-2027-1001"}
+  ]}'
+
+echo "### 27. 撤销后用新批次键引用已撤销证书 → 422 CERTIFICATE_REVOKED, details.index=1，整批不落库"
+post /measurement-batches \
+  '{"batch_key":"lab-upload-after-revoke","records":[
+    {"device_id":"EQ-100","measured_at":"2026-08-01T10:30:00+08:00","certificate_no":"CERT-2026-1001"}
+  ]}'
+
+echo "### 28. 批次记录可经既有查询接口读到（实时有效性反映撤销状态）"
+get "/measurements?device_id=EQ-100&limit=20"

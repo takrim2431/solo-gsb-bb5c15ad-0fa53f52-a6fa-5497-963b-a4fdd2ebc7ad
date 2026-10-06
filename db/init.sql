@@ -34,18 +34,69 @@ CREATE TABLE IF NOT EXISTS certificates (
 CREATE INDEX IF NOT EXISTS certificates_device_idx ON certificates (device_id);
 
 -- ---------------------------------------------------------------------------
+-- 测量批次表：一次上传一批有序测量记录的幂等登记
+--   * batch_key 全局唯一：相同键的并发提交最多成功一批
+--   * request_hash 为有序内容的规范化哈希（测量时刻统一换算 UTC），
+--     同键异内容返回 409
+--   * response_json 保存首次成功的完整响应快照：同键同内容重放时原样返回，
+--     即使引用的证书后来被撤销
+--   * 批次行只增不改：写入事务内先取批次序列 id、插入本批测量记录，最后一次性
+--     插入本行（携带响应快照），快照一旦写入即终态，无需事后 UPDATE
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS measurement_batches (
+    id            BIGSERIAL    PRIMARY KEY,
+    batch_key     TEXT         NOT NULL,
+    request_hash  TEXT         NOT NULL,
+    record_count  INT          NOT NULL,
+    response_json JSONB        NOT NULL,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+
+    CONSTRAINT measurement_batches_count_chk CHECK (record_count >= 1),
+    CONSTRAINT measurement_batches_key_uq UNIQUE (batch_key)
+);
+
+CREATE OR REPLACE FUNCTION reject_batch_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'measurement batches are immutable: UPDATE/DELETE not allowed';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS measurement_batches_immutable_trg ON measurement_batches;
+CREATE TRIGGER measurement_batches_immutable_trg
+    BEFORE UPDATE OR DELETE ON measurement_batches
+    FOR EACH ROW EXECUTE FUNCTION reject_batch_mutation();
+
+-- ---------------------------------------------------------------------------
 -- 测量记录表：一经写入不可修改、不可删除（触发器强制）
+--   * 单条写入时 batch_id / position 均为 NULL
+--   * 批次写入时 batch_id 指向 measurement_batches，position 为输入中的
+--     从 1 开始的序号；(batch_id, position) 唯一
+--   * 指向批次表的外键为 DEFERRABLE INITIALLY DEFERRED：批次事务先取批次
+--     序列 id 并插入本批测量记录，最后才插入批次行（携带响应快照），
+--     外键在提交时检查，保证"有批次行必有快照"且批次行无需事后更新
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS measurements (
     id             BIGSERIAL    PRIMARY KEY,
     device_id      TEXT         NOT NULL,
     measured_at    TIMESTAMPTZ  NOT NULL,
     certificate_id BIGINT       NOT NULL REFERENCES certificates (id),
-    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now()
+    batch_id       BIGINT,
+    position       INT,
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
+
+    CONSTRAINT measurements_batch_fk
+        FOREIGN KEY (batch_id) REFERENCES measurement_batches (id)
+        DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT measurements_batch_position_chk CHECK (
+        (batch_id IS NULL AND position IS NULL)
+        OR (batch_id IS NOT NULL AND position IS NOT NULL AND position >= 1)
+    )
 );
 
 CREATE INDEX IF NOT EXISTS measurements_device_idx ON measurements (device_id);
 CREATE INDEX IF NOT EXISTS measurements_cert_idx   ON measurements (certificate_id);
+CREATE UNIQUE INDEX IF NOT EXISTS measurements_batch_position_uq
+    ON measurements (batch_id, position) WHERE batch_id IS NOT NULL;
 
 CREATE OR REPLACE FUNCTION reject_measurement_mutation() RETURNS trigger AS $$
 BEGIN

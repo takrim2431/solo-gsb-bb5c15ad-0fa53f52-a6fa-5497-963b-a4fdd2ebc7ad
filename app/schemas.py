@@ -51,6 +51,30 @@ class MeasurementCreate(BaseModel):
     certificate_no: str = Field(min_length=1, max_length=128, description="证书编号")
 
 
+# ---------------------------------------------------------------------------
+# 测量批次
+# ---------------------------------------------------------------------------
+
+class MeasurementBatchItem(BaseModel):
+    device_id: str = Field(min_length=1, max_length=128, description="设备编号")
+    measured_at: AwareDatetime = Field(description="测量时刻（须带时区）")
+    certificate_no: str = Field(min_length=1, max_length=128, description="证书编号")
+
+
+class MeasurementBatchCreate(BaseModel):
+    batch_key: str = Field(
+        min_length=1,
+        max_length=255,
+        description="批次键：相同键 + 相同有序内容的重试返回首次结果；"
+        "相同键 + 不同内容返回 409；相同键的并发提交最多生成一批",
+    )
+    records: list[MeasurementBatchItem] = Field(
+        min_length=1,
+        max_length=1000,
+        description="按顺序排列的测量记录；任一条不合格则整批拒绝、不落库",
+    )
+
+
 class Validity(BaseModel):
     is_valid: bool
     reason: str
@@ -64,6 +88,18 @@ class MeasurementOut(BaseModel):
     certificate_id: int
     created_at: datetime
     validity: Validity = Field(description="该记录按当前证书状态计算的实时有效性")
+
+
+class MeasurementBatchOut(BaseModel):
+    batch_key: str
+    record_count: int
+    record_ids: list[int] = Field(
+        description="与输入顺序一一对应的记录标识（records[i] -> record_ids[i]）"
+    )
+    records: list[MeasurementOut] = Field(
+        description="按输入顺序排列的已写入记录；重放时返回首次提交时的快照"
+    )
+    created_at: datetime
 
 
 # ---------------------------------------------------------------------------
