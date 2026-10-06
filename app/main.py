@@ -6,7 +6,7 @@ from fastapi import FastAPI
 
 from . import db
 from .errors import ApiError, api_error_handler
-from .routers import certificates, measurements
+from .routers import certificates, measurement_batches, measurements
 
 
 @asynccontextmanager
@@ -27,6 +27,11 @@ app.add_exception_handler(ApiError, api_error_handler)
 
 app.include_router(certificates.router, prefix="/api/v1/certificates", tags=["certificates"])
 app.include_router(measurements.router, prefix="/api/v1/measurements", tags=["measurements"])
+app.include_router(
+    measurement_batches.router,
+    prefix="/api/v1/measurement-batches",
+    tags=["measurement-batches"],
+)
 
 
 @app.get("/health", tags=["meta"])

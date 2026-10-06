@@ -34,10 +34,46 @@ CREATE TABLE IF NOT EXISTS certificates (
 CREATE INDEX IF NOT EXISTS certificates_device_idx ON certificates (device_id);
 
 -- ---------------------------------------------------------------------------
+-- 测量批次表：批次键幂等 + 首次结果持久化
+--   * batch_key 全局唯一：并发提交同一键至多生成一批（唯一约束保证）
+--   * request_hash 为有序记录内容的规范化哈希（测量时刻统一换算 UTC），
+--     用于识别"同键不同内容"冲突；记录顺序不同也算不同内容
+--   * 首次提交的最终结果原样持久化：
+--       succeeded -> measurement_ids（与输入顺序一一对应）
+--       failed    -> 第一条不合格记录的序号（0-based）与原因
+--     此后同键同内容重试（即使证书已撤销）一律返回首次结果
+--   * 批次行只追加，不提供修改/删除接口
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS measurement_batches (
+    id              BIGSERIAL    PRIMARY KEY,
+    batch_key       TEXT         NOT NULL,
+    request_hash    TEXT         NOT NULL,
+    status          TEXT         NOT NULL,
+    measurement_ids BIGINT[],
+    error_index     INT,
+    error_code      TEXT,
+    error_message   TEXT,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+
+    CONSTRAINT measurement_batches_key_uq UNIQUE (batch_key),
+    CONSTRAINT measurement_batches_status_chk CHECK (status IN ('succeeded', 'failed')),
+    CONSTRAINT measurement_batches_result_chk CHECK (
+        (status = 'succeeded' AND measurement_ids IS NOT NULL
+                               AND error_index IS NULL AND error_code IS NULL)
+        OR
+        (status = 'failed' AND measurement_ids IS NULL
+                            AND error_index IS NOT NULL AND error_code IS NOT NULL
+                            AND error_message IS NOT NULL)
+    )
+);
+
+-- ---------------------------------------------------------------------------
 -- 测量记录表：一经写入不可修改、不可删除（触发器强制）
+--   * batch_id 非空时标识该记录由哪一批次写入（单条写入为 NULL）
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS measurements (
     id             BIGSERIAL    PRIMARY KEY,
+    batch_id       BIGINT       REFERENCES measurement_batches (id) DEFERRABLE INITIALLY DEFERRED,
     device_id      TEXT         NOT NULL,
     measured_at    TIMESTAMPTZ  NOT NULL,
     certificate_id BIGINT       NOT NULL REFERENCES certificates (id),
@@ -46,6 +82,22 @@ CREATE TABLE IF NOT EXISTS measurements (
 
 CREATE INDEX IF NOT EXISTS measurements_device_idx ON measurements (device_id);
 CREATE INDEX IF NOT EXISTS measurements_cert_idx   ON measurements (certificate_id);
+CREATE INDEX IF NOT EXISTS measurements_batch_idx  ON measurements (batch_id);
+
+-- 兼容旧库：measurements 已存在时幂等补列（外键同样设为延迟约束）
+ALTER TABLE measurements ADD COLUMN IF NOT EXISTS batch_id BIGINT;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'measurements_batch_id_fkey'
+    ) THEN
+        ALTER TABLE measurements
+            ADD CONSTRAINT measurements_batch_id_fkey
+            FOREIGN KEY (batch_id) REFERENCES measurement_batches (id)
+            DEFERRABLE INITIALLY DEFERRED;
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS measurements_batch_idx ON measurements (batch_id);
 
 CREATE OR REPLACE FUNCTION reject_measurement_mutation() RETURNS trigger AS $$
 BEGIN
@@ -91,3 +143,15 @@ DROP TRIGGER IF EXISTS measurement_corrections_immutable_trg ON measurement_corr
 CREATE TRIGGER measurement_corrections_immutable_trg
     BEFORE UPDATE OR DELETE ON measurement_corrections
     FOR EACH ROW EXECUTE FUNCTION reject_correction_mutation();
+
+-- 批次行同样只追加：首次结果一经确定不得修改或删除（保证幂等重放永远返回首次结果）
+CREATE OR REPLACE FUNCTION reject_batch_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'measurement batches are immutable: UPDATE/DELETE not allowed';
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS measurement_batches_immutable_trg ON measurement_batches;
+CREATE TRIGGER measurement_batches_immutable_trg
+    BEFORE UPDATE OR DELETE ON measurement_batches
+    FOR EACH ROW EXECUTE FUNCTION reject_batch_mutation();

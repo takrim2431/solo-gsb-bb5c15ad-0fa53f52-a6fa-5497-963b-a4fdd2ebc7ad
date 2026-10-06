@@ -51,6 +51,31 @@ class MeasurementCreate(BaseModel):
     certificate_no: str = Field(min_length=1, max_length=128, description="证书编号")
 
 
+# ---------------------------------------------------------------------------
+# 测量批次
+# ---------------------------------------------------------------------------
+
+class MeasurementBatchCreate(BaseModel):
+    batch_key: str = Field(
+        min_length=1,
+        max_length=255,
+        description="批次键：由调用方指定，相同键 + 相同有序内容重试返回首次结果",
+    )
+    records: list[MeasurementCreate] = Field(
+        min_length=1,
+        max_length=1000,
+        description="按顺序排列的测量记录；任一条不合格则整批不落库",
+    )
+
+
+class MeasurementBatchOut(BaseModel):
+    batch_key: str
+    measurement_ids: list[int] = Field(
+        description="与输入记录顺序一一对应的测量记录标识"
+    )
+    created_at: datetime
+
+
 class Validity(BaseModel):
     is_valid: bool
     reason: str
